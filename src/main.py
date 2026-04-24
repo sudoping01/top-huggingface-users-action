@@ -65,7 +65,8 @@ def api_get(url, retries=MAX_RETRIES):
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
                 continue
-            if resp.status_code == 404:
+            if resp.status_code in (401, 403, 404):
+                print(f"  [HTTP {resp.status_code}] {url}")
                 return None
             print(f"  [HTTP {resp.status_code}] {url}")
             if attempt < retries - 1:
@@ -98,7 +99,7 @@ def search_city(city):
                     seen_names.add(uname)
                     combined.append(item)
 
-    data = api_get(f"{HF_API}/quicksearch?q={q}&type=user&limit=100")
+    data = api_get(f"{HF_API}/quicksearch?q={q}&type=user&limit=20")
     if isinstance(data, dict):
         for item in data.get("users", []):
             uname = (item.get("user") or item.get("name") or item.get("id") or "").strip()
@@ -596,7 +597,9 @@ def main():
         checkpoint_data = json.load(f)
 
     if not HF_TOKEN:
-        raise EnvironmentError("HF_TOKEN is required but not set.")
+        print("WARNING: HF_TOKEN is not set — only quicksearch (unauthenticated) will be used. Results will be limited.")
+    else:
+        print("HF_TOKEN: present")
 
     dev_mode = config.get("devMode", "false") == "true"
     locations = config["locations"]
@@ -607,7 +610,7 @@ def main():
     timestamp = datetime.now(timezone.utc).strftime("%Y/%m/%d %I:%M %p UTC")
     processed = []
 
-    print(f"HF_TOKEN: present | countriesPerRun: {countries_per_run} | checkpoint: {checkpoint}/{len(locations)-1}")
+    print(f"countriesPerRun: {countries_per_run} | checkpoint: {checkpoint}/{len(locations)-1}")
 
     for i in range(countries_per_run):
         idx = (checkpoint + i) % len(locations)
