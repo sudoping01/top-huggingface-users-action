@@ -90,15 +90,7 @@ def search_city(city):
     seen_names = set()
     combined = []
 
-    if HF_TOKEN:
-        data = api_get(f"{HF_API}/users?search={q}&limit=100")
-        if isinstance(data, list):
-            for item in data:
-                uname = (item.get("user") or item.get("name") or item.get("id") or "").strip()
-                if uname and uname not in seen_names:
-                    seen_names.add(uname)
-                    combined.append(item)
-
+    # Quicksearch: finds users whose username/fullname contains the term
     data = api_get(f"{HF_API}/quicksearch?q={q}&type=user&limit=20")
     if isinstance(data, dict):
         for item in data.get("users", []):
@@ -106,6 +98,16 @@ def search_city(city):
             if uname and uname not in seen_names:
                 seen_names.add(uname)
                 combined.append(item)
+
+    # Models/datasets/spaces: find authors who published content related to the term
+    for kind in ("models", "datasets", "spaces"):
+        items = api_get(f"{HF_API}/{kind}?search={q}&limit=50&full=false")
+        if isinstance(items, list):
+            for item in items:
+                author = (item.get("author") or item.get("id", "").split("/")[0]).strip()
+                if author and author not in seen_names:
+                    seen_names.add(author)
+                    combined.append({"user": author})
 
     return combined
 
