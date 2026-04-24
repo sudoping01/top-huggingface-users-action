@@ -86,15 +86,27 @@ def search_city(city):
         return []
     q = urllib.parse.quote(city)
 
-    if HF_TOKEN:
+    seen_names = set()
+    combined = []
 
+    if HF_TOKEN:
         data = api_get(f"{HF_API}/users?search={q}&limit=100")
         if isinstance(data, list):
-            return data
+            for item in data:
+                uname = (item.get("user") or item.get("name") or item.get("id") or "").strip()
+                if uname and uname not in seen_names:
+                    seen_names.add(uname)
+                    combined.append(item)
+
     data = api_get(f"{HF_API}/quicksearch?q={q}&type=user&limit=100")
     if isinstance(data, dict):
-        return data.get("users", [])
-    return []
+        for item in data.get("users", []):
+            uname = (item.get("user") or item.get("name") or item.get("id") or "").strip()
+            if uname and uname not in seen_names:
+                seen_names.add(uname)
+                combined.append(item)
+
+    return combined
 
 
 
@@ -198,10 +210,10 @@ def process_country(location_data):
         print(f"  {len(results)} candidates found")
 
         for item in results:
-            uname = (item.get("user") or item.get("login") or "").strip()
+            uname = (item.get("user") or item.get("login") or item.get("name") or item.get("id") or "").strip()
             utype = item.get("type", "user")
             if uname and utype != "org" and uname not in seen:
-                seen[uname] = item  
+                seen[uname] = item
         time.sleep(0.5)
 
     print(f"\nUnique users to enrich: {len(seen)}")
