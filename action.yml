@@ -1,0 +1,19 @@
+name: 'Top HuggingFace Users Action'
+description: 'Rank HuggingFace users by country based on models, downloads, likes, and followers'
+inputs:
+  GIT_TOKEN:
+    description: 'GitHub Personal Access Token'
+    required: true
+  HF_TOKEN:
+    description: 'HuggingFace API Token'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - run: pip install -r ${{ github.action_path }}/requirements.txt
+      shell: bash
+    - run: python ${{ github.action_path }}/src/main.py
+      shell: bash
+      env:
+        GIT_TOKEN: ${{ inputs.GIT_TOKEN }}
+        HF_TOKEN: ${{ inputs.HF_TOKEN }}
