@@ -155,12 +155,14 @@ def build_user_record(username, search_item=None):
     #   1. Authenticated /api/users?search= results (search_item)
     #   2. Overview might have them in future API versions
     si = search_item or {}
+    _si_details = si.get("details")
+    _si_details = _si_details if isinstance(_si_details, dict) else {}
     location = (
-        si.get("location") or si.get("details", {}).get("location")
+        si.get("location") or _si_details.get("location")
         or overview.get("location") or ""
     ).strip() or "No Location"
     company = (
-        si.get("company") or si.get("details", {}).get("company")
+        si.get("company") or _si_details.get("company")
         or overview.get("company") or ""
     ).strip() or "No Company"
 
@@ -201,18 +203,37 @@ def process_country(location_data):
 
     seen = {}
 
-    for city in location_data["cities"]:
-        city = city.strip()
-        if not city:
-            continue
-        print(f"\nCity: {city}")
-        results = search_city(city)
+    # Search by country/geo name first — the authenticated endpoint (/api/users?search=)
+    # indexes the location field, so country-level terms are more likely to surface users
+    # who explicitly set their location (e.g. "Senegal", "France").  City names follow as
+    # a secondary pass for users who set a more specific location.
+    country_terms = list(dict.fromkeys([
+        location_data["country"],
+        location_data["geoName"],
+    ]))
+    search_terms = country_terms + [c.strip() for c in location_data["cities"] if c.strip()]
+
+    for term in search_terms:
+        print(f"\nSearching: {term!r}")
+        results = search_city(term)
         print(f"  {len(results)} candidates found")
 
         for item in results:
             uname = (item.get("user") or item.get("login") or item.get("name") or item.get("id") or "").strip()
             utype = item.get("type", "user")
             if uname and utype != "org" and uname not in seen:
+                # Pre-filter: if the search result already carries location data,
+                # skip candidates that clearly belong to a different country.
+                # Items without location data pass through and are checked after
+                # the full profile is fetched.
+                _details = item.get("details")
+                item_location = (
+                    item.get("location")
+                    or (_details.get("location") if isinstance(_details, dict) else "")
+                    or ""
+                ).strip()
+                if item_location and not location_matches(item_location, location_data):
+                    continue
                 seen[uname] = item
         time.sleep(0.5)
 
@@ -225,7 +246,11 @@ def process_country(location_data):
             records.append(record)
         time.sleep(0.5)
 
-    print(f"\nTotal records: {len(records)}")
+    # Post-filter: drop anyone whose profile location doesn't match this country.
+    # Catches users whose name/username coincidentally matched the city search.
+    before = len(records)
+    records = [r for r in records if location_matches(r["location"], location_data)]
+    print(f"\nLocation filter: {before} → {len(records)} users kept")
     return records
 
 
@@ -265,6 +290,20 @@ def _fmt(v):
     if v >= 1_000:
         return f"{v / 1_000:.1f}K"
     return str(v)
+
+
+def location_matches(user_location, location_data):
+    """Return True if the user's location plausibly maps to this country.
+
+    Users with no location set are kept (can't prove they're wrong).
+    Users with a location that doesn't mention this country/cities are dropped.
+    """
+    if not user_location or user_location == "No Location":
+        return True  # no location data → benefit of the doubt
+    loc = user_location.lower()
+    terms = [location_data["country"].lower(), location_data["geoName"].lower()]
+    terms += [c.strip().lower() for c in location_data["cities"] if c.strip()]
+    return any(t and t in loc for t in terms)
 
 
 RANK_CONFIG = {
