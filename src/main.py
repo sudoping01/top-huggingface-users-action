@@ -80,8 +80,54 @@ def api_get(url, retries=MAX_RETRIES):
     return None
 
 
+def get_hf_github_username(username):
+    """Parse the HF profile page to find the linked GitHub username."""
+    import re as _re
+    try:
+        resp = SESSION.get(f"https://huggingface.co/{username}", timeout=15)
+        if resp.status_code == 200:
+            m = _re.search(r'github&quot;:&quot;([^&]+)&quot;', resp.text)
+            if m:
+                return m.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+def get_github_location(gh_username):
+    """Query the GitHub API for a user's location field.
+
+    Uses a plain requests call (not the HF session) so the HF token is never
+    sent to GitHub.  Falls back to unauthenticated if the token gives a 401.
+    """
+    gh_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    base_headers = {"User-Agent": "top-huggingface-users/1.0", "Accept": "application/vnd.github+json"}
+    url = f"https://api.github.com/users/{gh_username}"
+    try:
+        headers = {**base_headers, "Authorization": f"Bearer {gh_token}"} if gh_token else base_headers
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 401 and gh_token:
+            # Token rejected — retry without auth
+            resp = requests.get(url, headers=base_headers, timeout=15)
+        if resp.status_code == 200:
+            return (resp.json().get("location") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 def search_city(city):
-    """Return list of user dicts for a city search."""
+    """Return list of user dicts for a city/country search.
+
+    Uses the authenticated /api/users endpoint (when HF_TOKEN is set) which
+    searches profile fields including location, then supplements with quicksearch
+    which matches on username/fullname.
+
+    Content-based author harvesting (models/datasets/spaces search) is omitted —
+    it produces large numbers of false positives: authors whose *content* mentions
+    the city but who may be located anywhere, and who have no location set so they
+    cannot be filtered out.
+    """
     city = city.strip()
     if not city:
         return []
@@ -90,7 +136,17 @@ def search_city(city):
     seen_names = set()
     combined = []
 
-    # Quicksearch: finds users whose username/fullname contains the term
+    if HF_TOKEN:
+        # Authenticated endpoint searches profile fields incl. location
+        data = api_get(f"{HF_API}/users?search={q}&limit=100")
+        if isinstance(data, list):
+            for item in data:
+                uname = (item.get("user") or item.get("name") or item.get("id") or "").strip()
+                if uname and uname not in seen_names:
+                    seen_names.add(uname)
+                    combined.append(item)
+
+    # Quicksearch: matches username/fullname — always run as a complement
     data = api_get(f"{HF_API}/quicksearch?q={q}&type=user&limit=20")
     if isinstance(data, dict):
         for item in data.get("users", []):
@@ -98,16 +154,6 @@ def search_city(city):
             if uname and uname not in seen_names:
                 seen_names.add(uname)
                 combined.append(item)
-
-    # Models/datasets/spaces: find authors who published content related to the term
-    for kind in ("models", "datasets", "spaces"):
-        items = api_get(f"{HF_API}/{kind}?search={q}&limit=50&full=false")
-        if isinstance(items, list):
-            for item in items:
-                author = (item.get("author") or item.get("id", "").split("/")[0]).strip()
-                if author and author not in seen_names:
-                    seen_names.add(author)
-                    combined.append({"user": author})
 
     return combined
 
@@ -154,16 +200,24 @@ def build_user_record(username, search_item=None):
     time.sleep(0.3)
     spaces = get_spaces(username)
 
-    # Location / company come from:
-    #   1. Authenticated /api/users?search= results (search_item)
-    #   2. Overview might have them in future API versions
+    # Location priority:
+    #   1. Authenticated /api/users?search= result (search_item)
+    #   2. Overview API
+    #   3. GitHub profile (fetched via linked GitHub account on HF profile page)
     si = search_item or {}
     _si_details = si.get("details")
     _si_details = _si_details if isinstance(_si_details, dict) else {}
     location = (
         si.get("location") or _si_details.get("location")
         or overview.get("location") or ""
-    ).strip() or "No Location"
+    ).strip()
+    if not location:
+        gh_username = get_hf_github_username(username)
+        if gh_username:
+            location = get_github_location(gh_username)
+            if location:
+                print(f"    [{username}] location via GitHub (@{gh_username}): {location}")
+    location = location or "No Location"
     company = (
         si.get("company") or _si_details.get("company")
         or overview.get("company") or ""
@@ -249,12 +303,22 @@ def process_country(location_data):
             records.append(record)
         time.sleep(0.5)
 
-    # Post-filter: drop anyone whose profile location doesn't match this country.
-    # Catches users whose name/username coincidentally matched the city search.
-    before = len(records)
-    records = [r for r in records if location_matches(r["location"], location_data)]
-    print(f"\nLocation filter: {before} → {len(records)} users kept")
-    return records
+    # Split into verified (location confirmed) and unverified (no location found).
+    # Drop users whose location is confirmed to be in a different country.
+    verified, unverified, dropped = [], [], []
+    for r in records:
+        loc = r["location"]
+        if loc == "No Location":
+            r["location_verified"] = False
+            unverified.append(r)
+        elif location_matches(loc, location_data):
+            r["location_verified"] = True
+            verified.append(r)
+        else:
+            dropped.append(r)
+
+    print(f"\nLocation split: {len(verified)} verified, {len(unverified)} unverified, {len(dropped)} wrong country dropped")
+    return verified + unverified
 
 
 
@@ -466,7 +530,7 @@ def _share_table(title, page_url):
     return f"<table>\n\t<tr>\n{cells}\n\t</tr>\n</table>"
 
 
-def generate_markdown(repo, location_data, users, rank_by, timestamp):
+def generate_markdown(repo, location_data, users, rank_by, timestamp, unverified=False):
     cfg = RANK_CONFIG[rank_by]
     sort_key = cfg["sort_key"]
     rank_label = cfg["label"]
@@ -478,11 +542,15 @@ def generate_markdown(repo, location_data, users, rank_by, timestamp):
     cities_str = ", ".join(c.strip().capitalize() for c in location_data["cities"] if c.strip())
     slug = _slug(country)
 
-    title = f"Top HuggingFace Users By {rank_label} in {geo_name}"
-    page_url = f"https://github.com/{repo}/blob/main/markdown/{rank_by}/{slug}.md"
+    suffix = "_unverified" if unverified else ""
+    title = (
+        f"Top HuggingFace Users By {rank_label} in {geo_name} — Unverified Location"
+        if unverified else
+        f"Top HuggingFace Users By {rank_label} in {geo_name}"
+    )
+    page_url = f"https://github.com/{repo}/blob/main/markdown/{rank_by}/{slug}{suffix}.md"
 
     sorted_users = sorted(users, key=lambda u: u.get(sort_key, 0), reverse=True)
-
 
     nav_cells = []
     for rk in NAV_ORDER:
@@ -490,7 +558,7 @@ def generate_markdown(repo, location_data, users, rank_by, timestamp):
         if rk == rank_by:
             nav_cells.append(f"\t\t<td>\n\t\t\t<strong>{nav_label}</strong>\n\t\t</td>")
         else:
-            href = f"https://github.com/{repo}/blob/main/markdown/{rk}/{slug}.md"
+            href = f"https://github.com/{repo}/blob/main/markdown/{rk}/{slug}{suffix}.md"
             nav_cells.append(f'\t\t<td>\n\t\t\t<a href="{href}">{nav_label}</a>\n\t\t</td>')
     nav_html = "<table>\n\t<tr>\n" + "\n".join(nav_cells) + "\n\t</tr>\n</table>"
 
@@ -532,6 +600,27 @@ def generate_markdown(repo, location_data, users, rank_by, timestamp):
     share_table = _share_table(title, page_url)
     owner = repo.split("/")[0]
 
+    verified_url = f"https://github.com/{repo}/blob/main/markdown/{rank_by}/{slug}.md"
+    unverified_url = f"https://github.com/{repo}/blob/main/markdown/{rank_by}/{slug}_unverified.md"
+
+    if unverified:
+        location_note = (
+            f"> **Unverified location** — These `{len(users)} users` were found via searches "
+            f"for `{geo_name}` and its cities (`{cities_str}`), but their HuggingFace and "
+            f"GitHub profiles do not include a location we could confirm. They may or may not "
+            f"be based in {geo_name}.\n"
+            f">\n"
+            f"> See the verified list: [Top Users in {geo_name}]({verified_url})\n"
+        )
+    else:
+        location_note = (
+            f"There are `{len(users)} users` in {geo_name} with a confirmed location. "
+            f"You need at least `0 followers` to be on this list.\n"
+            f"\n"
+            f"Users found via the {geo_name} search but whose location could not be confirmed "
+            f"are listed separately: [Unverified location users]({unverified_url})\n"
+        )
+
     return (
         f"# {title}\n"
         f"[![Top HuggingFace Users]"
@@ -547,9 +636,7 @@ def generate_markdown(repo, location_data, users, rank_by, timestamp):
         f"\n"
         f"There are `138 countries` and `674 cities` can be found [here](https://github.com/{repo}).\n"
         f"\n"
-        f"There are `{len(users)} users` in {geo_name}. "
-        f"You need at least `0 followers` to be on this list.\n"
-        f"\n"
+        f"{location_note}\n"
         f"<table>\n\t<tr>\n\t\t<td>\n\t\t\tDon't forget to star ⭐ this repository\n\t\t</td>\n\t</tr>\n</table>\n"
         f"\n"
         f"{nav_html}\n"
@@ -580,14 +667,24 @@ def generate_markdown(repo, location_data, users, rank_by, timestamp):
 
 def save_markdown_files(repo, location_data, users, timestamp):
     slug = _slug(location_data["country"])
+    verified = [u for u in users if u.get("location_verified", False)]
+    unverified = [u for u in users if not u.get("location_verified", False)]
     for rank_by in RANK_CONFIG:
         dir_path = os.path.join(MARKDOWN_DIR, rank_by)
         os.makedirs(dir_path, exist_ok=True)
-        content = generate_markdown(repo, location_data, users, rank_by, timestamp)
-        path = os.path.join(dir_path, f"{slug}.md")
-        with open(path, "w", encoding="utf-8") as f:
+        # Main page: verified users only
+        content = generate_markdown(repo, location_data, verified, rank_by, timestamp, unverified=False)
+        with open(os.path.join(dir_path, f"{slug}.md"), "w", encoding="utf-8") as f:
             f.write(content)
-    print(f"Markdown written: {len(RANK_CONFIG)} files for {location_data['country']}")
+        # Unverified page: separate file
+        if unverified:
+            content_unv = generate_markdown(repo, location_data, unverified, rank_by, timestamp, unverified=True)
+            with open(os.path.join(dir_path, f"{slug}_unverified.md"), "w", encoding="utf-8") as f:
+                f.write(content_unv)
+    print(
+        f"Markdown written: {len(RANK_CONFIG)} files for {location_data['country']} "
+        f"({len(verified)} verified, {len(unverified)} unverified)"
+    )
 
 
 
