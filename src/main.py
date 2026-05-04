@@ -200,23 +200,25 @@ def build_user_record(username, search_item=None):
     time.sleep(0.3)
     spaces = get_spaces(username)
 
-    # Location priority:
-    #   1. Authenticated /api/users?search= result (search_item)
-    #   2. Overview API
-    #   3. GitHub profile (fetched via linked GitHub account on HF profile page)
     si = search_item or {}
     _si_details = si.get("details")
     _si_details = _si_details if isinstance(_si_details, dict) else {}
-    location = (
-        si.get("location") or _si_details.get("location")
-        or overview.get("location") or ""
-    ).strip()
+
+    # Location priority:
+    #   1. GitHub profile (linked GitHub account on HF profile page) — most reliable
+    #   2. Authenticated /api/users?search= result (search_item)
+    #   3. Overview API
+    location = ""
+    gh_username = get_hf_github_username(username)
+    if gh_username:
+        location = get_github_location(gh_username)
+        if location:
+            print(f"    [{username}] location via GitHub (@{gh_username}): {location}")
     if not location:
-        gh_username = get_hf_github_username(username)
-        if gh_username:
-            location = get_github_location(gh_username)
-            if location:
-                print(f"    [{username}] location via GitHub (@{gh_username}): {location}")
+        location = (
+            si.get("location") or _si_details.get("location")
+            or overview.get("location") or ""
+        ).strip()
     location = location or "No Location"
     company = (
         si.get("company") or _si_details.get("company")
