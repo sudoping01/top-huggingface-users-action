@@ -80,6 +80,17 @@ def api_get(url, retries=MAX_RETRIES):
     return None
 
 
+GH_API = "https://api.github.com"
+
+
+def _gh_headers():
+    gh_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    h = {"User-Agent": "top-huggingface-users/1.0", "Accept": "application/vnd.github+json"}
+    if gh_token:
+        h["Authorization"] = f"Bearer {gh_token}"
+    return h
+
+
 def get_hf_github_username(username):
     """Parse the HF profile page to find the linked GitHub username."""
     import re as _re
@@ -95,25 +106,67 @@ def get_hf_github_username(username):
 
 
 def get_github_location(gh_username):
-    """Query the GitHub API for a user's location field.
-
-    Uses a plain requests call (not the HF session) so the HF token is never
-    sent to GitHub.  Falls back to unauthenticated if the token gives a 401.
-    """
-    gh_token = os.environ.get("GITHUB_TOKEN", "").strip()
-    base_headers = {"User-Agent": "top-huggingface-users/1.0", "Accept": "application/vnd.github+json"}
-    url = f"https://api.github.com/users/{gh_username}"
+    """Query the GitHub API for a user's location field."""
     try:
-        headers = {**base_headers, "Authorization": f"Bearer {gh_token}"} if gh_token else base_headers
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 401 and gh_token:
-            # Token rejected — retry without auth
-            resp = requests.get(url, headers=base_headers, timeout=15)
+        resp = requests.get(f"{GH_API}/users/{gh_username}", headers=_gh_headers(), timeout=15)
+        if resp.status_code == 401:
+            resp = requests.get(f"{GH_API}/users/{gh_username}",
+                                headers={"User-Agent": "top-huggingface-users/1.0",
+                                         "Accept": "application/vnd.github+json"},
+                                timeout=15)
         if resp.status_code == 200:
             return (resp.json().get("location") or "").strip()
     except Exception:
         pass
     return ""
+
+
+def search_github_users_by_location(term):
+    """Return GitHub logins of users whose location field contains term."""
+    q = urllib.parse.quote(f'location:"{term}"')
+    url = f"{GH_API}/search/users?q={q}&per_page=100&sort=followers&order=desc"
+    try:
+        resp = requests.get(url, headers=_gh_headers(), timeout=30)
+        if resp.status_code == 200:
+            return [u["login"] for u in resp.json().get("items", [])]
+        if resp.status_code == 403:
+            retry_after = int(resp.headers.get("Retry-After", 60))
+            print(f"  [GitHub] rate limited on search, sleeping {retry_after}s")
+            time.sleep(retry_after)
+    except Exception as exc:
+        print(f"  [GitHub] search error for {term!r}: {exc}")
+    return []
+
+
+def find_hf_username_for_github_user(gh_login):
+    """Try to resolve a GitHub login to a HuggingFace username.
+
+    1. Same-username heuristic: check huggingface.co/{gh_login}.
+    2. Parse GitHub profile bio/blog for huggingface.co/ links.
+    """
+    import re as _re
+
+    # 1. Same-username — most common case (e.g. sudoping01 on both platforms)
+    data = api_get(f"{HF_API}/users/{gh_login}/overview")
+    if data and isinstance(data, dict):
+        return gh_login
+
+    # 2. Fetch GitHub profile and scan bio/blog for an HF link
+    try:
+        resp = requests.get(f"{GH_API}/users/{gh_login}", headers=_gh_headers(), timeout=15)
+        if resp.status_code == 200:
+            profile = resp.json()
+            for field in ("bio", "blog"):
+                val = profile.get(field) or ""
+                m = _re.search(r'huggingface\.co/([A-Za-z0-9_.-]+)', val, _re.IGNORECASE)
+                if m:
+                    candidate = m.group(1).rstrip("/")
+                    if candidate:
+                        return candidate
+    except Exception:
+        pass
+
+    return None
 
 
 def search_city(city):
@@ -295,6 +348,32 @@ def process_country(location_data):
                     continue
                 seen[uname] = item
         time.sleep(0.5)
+
+    # GitHub-based discovery: find users whose GitHub location matches this country
+    # but who have no location set on HF — they would be invisible to the HF search above.
+    if os.environ.get("GITHUB_TOKEN", "").strip():
+        print(f"\nGitHub location discovery for {country}...")
+        gh_search_terms = ([location_data["geoName"]]
+                           + [c.strip() for c in location_data["cities"] if c.strip()])
+        gh_seen_logins: set = set()
+        for term in gh_search_terms:
+            print(f"  GitHub search: location:{term!r}")
+            gh_logins = search_github_users_by_location(term)
+            print(f"  {len(gh_logins)} GitHub users found")
+            for gh_login in gh_logins:
+                if gh_login in gh_seen_logins:
+                    continue
+                gh_seen_logins.add(gh_login)
+                if gh_login in seen:
+                    continue
+                hf_username = find_hf_username_for_github_user(gh_login)
+                if hf_username and hf_username not in seen:
+                    print(f"    [GitHub→HF] {gh_login} → {hf_username}")
+                    seen[hf_username] = {}
+                time.sleep(0.2)
+            time.sleep(1)
+    else:
+        print("\n[GitHub discovery skipped — no GITHUB_TOKEN]")
 
     print(f"\nUnique users to enrich: {len(seen)}")
     records = []
